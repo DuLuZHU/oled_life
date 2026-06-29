@@ -1,0 +1,248 @@
+需要完成一个OLED寿命预测的模型，现在有1023个pkl数据（字典），文件夹为lt_dataset，每一个pkl包括anode,ht,em,et,cathod,cp,life共7组key-value对，其中包括anode,ht,em,et,cathod,cp都是1039长度的np.ndarray，包含6层分别为[anode, ht, em, et, cathod, cp]，其中每一层都是1039维的数据，分别是0-1023: ecfp4,1024-1038: 分子特征标识符。life是9长度的np.ndarray（每一维分别是0: J,1: T,2: LT99,3: LT97,4: LT95,5: deltaV99,6: deltaV97,7: deltaV95,8: init_V ）。我现在需要在2.0文件夹中完成代码，模型要求是将6层[anode, ht, em, et, cathod, cp]作为输入，通过算法拟合life，其中输出不需要life的第0和1维。具体方案如下：
+---
+
+## 1. 问题定义与数据分析
+
+- **输入**：1023 个器件的 6 层材料特征，每层为 1039 维向量（0‑1023 位 ECFP4，1024‑1038 位分子属性）。
+- **输出**：寿命相关 7 个指标：`LT99, LT97, LT95, deltaV99, deltaV97, deltaV95, init_V`。（`life` 数组的第 2~8 维）
+- **关键抉择**：`life[0]` 和 `life[1]` 是电流密度 `J` 与温度 `T`，属于测试**条件**。虽然输出不需要它们，但它们对寿命有直接影响。**强烈建议将 `J, T` 加入输入特征**，否则模型无法区分不同测试条件下的寿命差异。
+---
+
+## 2. 数据加载与整合
+数据文件夹中的pkl文件为“器件名称.pkl”，每个文件是含 7 个键的字典。统一读取并处理：
+参考代码
+```python
+import numpy as np
+import pickle
+import glob
+
+data_dir = "lt_dataset"
+files = sorted(glob.glob(f"{data_dir}/*.pkl"), key=lambda x: int(x.split('/')[-1].split('.')[0]))
+
+X_materials = []   # (1023, 6, 1039)
+X_conditions = []  # (1023, 2)  J, T
+Y = []             # (1023, 7)  第2~8维
+
+for f in files:
+    with open(f, 'rb') as fh:
+        d = pickle.load(fh)
+    # 6层材料特征 (6, 1039)
+    layers = np.stack([d['anode'], d['ht'], d['em'], d['et'], d['cathod'], d['cp']], axis=0)
+    X_materials.append(layers)
+    # 条件 J, T
+    life = d['life']  # shape (9,)
+    X_conditions.append(life[:2])
+    # 目标 LT99...init_V
+    Y.append(life[2:])
+
+X_materials = np.array(X_materials)    # (N, 6, 1039)
+X_conditions = np.array(X_conditions)  # (N, 2)
+Y = np.array(Y)                        # (N, 7)
+```
+
+---
+
+## 3. 特征工程与预处理
+
+### 3.1 特征拆分与降噪
+- **ECFP4 部分**（0‑1023）：1024 位二进制指纹（或计数），稀疏度高。可保持原样，或使用 PCA 降维至 256‑512 维（需验证是否损失信息）。
+- **分子属性部分**（1024‑1038）：15 个连续特征，量纲差异大，需标准化。
+- **推荐**：将 6 层分别的 ECFP4 展平拼接，或先用嵌入思想压缩每层的指纹，再融合。
+
+### 3.2 条件特征
+- `J` 和 `T` 数量级不同，标准化处理。
+
+### 3.3 目标变换
+- 寿命和电压漂移值可能呈长尾分布，可尝试 `log(1+y)` 变换使分布更正态，提升回归稳定性。
+
+### 3.4 数据增强与划分
+- 样本量仅 1023，适合用 **k 折交叉验证**（k=5 或 10）评估模型泛化能力。
+- 最终测试集保持 20%，其余做训练+验证。
+
+代码示例（使用 sklearn）：
+
+```python
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler
+import numpy as np
+
+# 拆分特征：每层ECFP4与属性
+ecfp_dim = 1024
+prop_dim = 15
+N = len(X_materials)
+# 将6层特征处理成两种形式供不同模型使用
+# 方式A：全展平输入 (N, 6*1039)
+X_flat = X_materials.reshape(N, -1)
+
+# 添加条件
+X_full = np.concatenate([X_flat, X_conditions], axis=1)
+
+# 目标
+Y_raw = Y.copy()
+# 可选对数变换（针对 LT 和 deltaV 中的正值）
+Y_log = np.log1p(Y_raw)
+
+# 划分
+X_train, X_test, y_train, y_test = train_test_split(
+    X_full, Y_log, test_size=0.2, random_state=42
+)
+
+# 标准化
+scaler_X = StandardScaler().fit(X_train)
+X_train_s = scaler_X.transform(X_train)
+X_test_s = scaler_X.transform(X_test)
+
+scaler_y = StandardScaler().fit(y_train)
+y_train_s = scaler_y.transform(y_train)
+y_test_s = scaler_y.transform(y_test)
+```
+
+---
+
+## 4. 模型选择与设计
+
+由于样本量中等、特征维度高（6234+2），优先选择能处理高维、带正则化的模型：
+
+### 方案一：多任务全连接神经网络（推荐）
+- 可同时预测 7 个目标，共享表示层，有效利用多任务之间的相关性。
+- 结构：输入层 → 若干隐藏层（ReLU+Dropout+BatchNorm）→ 7 输出节点（线性）。
+
+```python
+import torch
+import torch.nn as nn
+
+class OLEDLifePredictor(nn.Module):
+    def __init__(self, input_dim, hidden_dims=[1024, 512, 256], dropout=0.3):
+        super().__init__()
+        layers = []
+        prev = input_dim
+        for h in hidden_dims:
+            layers.extend([
+                nn.Linear(prev, h),
+                nn.BatchNorm1d(h),
+                nn.ReLU(),
+                nn.Dropout(dropout)
+            ])
+            prev = h
+        self.shared = nn.Sequential(*layers)
+        self.head = nn.Linear(prev, 7)   # 7个输出
+
+    def forward(self, x):
+        return self.head(self.shared(x))
+```
+
+训练时使用 **MSE 损失**，优化器 AdamW，配合早停与学习率衰减。
+
+### 方案二：集成树模型（LightGBM / XGBoost）
+- 可为 7 个目标分别训练单输出回归器，或使用多输出包装器 `MultiOutputRegressor`。
+- 树模型天然处理特征量纲、缺失值，不需要大量调参。
+- 但无法利用多任务共享表示，且高维稀疏 ECFP 可能效率较低。
+
+### 方案三：卷积/注意力机制
+- 若希望模型感知“层顺序”（阳极→HT→EM→ET→阴极→CP），可将 6 层视为序列，用 1D CNN 或 Transformer 编码层间相互作用，再拼接条件特征。
+
+建议从 MLP 基线开始，逐步尝试复杂模型。
+
+---
+
+## 5. 训练与评估
+
+- **损失函数**：多输出 MSE；若做了 y 标准化，直接用标准化的 MSE。
+- **评估指标**：
+  - 每个目标的 RMSE、MAE、R²；
+  - 目标反标准化后（若做了变换）在原始空间计算误差。
+- **交叉验证**：使用 `KFold` 进行分组训练，记录验证集平均指标。
+
+训练循环示意：
+
+```python
+model = OLEDLifePredictor(input_dim=X_train_s.shape[1])
+optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+criterion = nn.MSELoss()
+
+for epoch in range(500):
+    model.train()
+    optimizer.zero_grad()
+    pred = model(torch.tensor(X_train_s, dtype=torch.float32))
+    loss = criterion(pred, torch.tensor(y_train_s, dtype=torch.float32))
+    loss.backward()
+    optimizer.step()
+    # 验证...
+```
+
+---
+
+## 6. 预测与后处理
+
+测试阶段：
+1. 对新样本加载 6 层材料特征 + 条件 `J, T`。
+2. 与训练时完全相同地预处理（展平、拼接、标准化 X，可选目标标准化）。
+3. 模型输出 7 维预测值。
+4. 若训练时对 y 做了标准化与对数变换，需逆向操作：
+   - 先反标准化 `y_raw_scale = scaler_y.inverse_transform(pred)`
+   - 再指数还原 `y_final = np.expm1(y_raw_scale)`
+5. 确保预测值物理合理性（例如 LT99 ≤ LT97 ≤ LT95，可后处理强制单调）。
+
+---
+
+## 7. 完整代码框架
+
+整合上述步骤的脚本结构：
+
+```python
+import numpy as np, pandas as pd, pickle, glob
+from sklearn.model_selection import train_test_split, KFold
+from sklearn.preprocessing import StandardScaler
+import torch, torch.nn as nn, torch.optim as optim
+
+# ========== 1. 数据加载 ==========
+def load_data(path="lt_dataset"):
+    files = sorted(glob.glob(f"{path}/*.pkl"), key=lambda x: int(x.split('/')[-1].split('.')[0]))
+    X_mat, X_cond, Y = [], [], []
+    for f in files:
+        with open(f, 'rb') as fh:
+            d = pickle.load(fh)
+        layers = np.stack([d['anode'], d['ht'], d['em'], d['et'], d['cathod'], d['cp']])
+        X_mat.append(layers)
+        life = d['life']
+        X_cond.append(life[:2])
+        Y.append(life[2:])
+    return np.array(X_mat), np.array(X_cond), np.array(Y)
+
+# ========== 2. 预处理 ==========
+X_mat, X_cond, Y = load_data()
+X_flat = X_mat.reshape(len(X_mat), -1)
+X = np.concatenate([X_flat, X_cond], axis=1)
+Y_log = np.log1p(Y)  # 可选
+
+X_train, X_test, y_train, y_test = train_test_split(X, Y_log, test_size=0.2, random_state=42)
+scaler_X = StandardScaler().fit(X_train)
+X_train_s = scaler_X.transform(X_train)
+X_test_s = scaler_X.transform(X_test)
+
+scaler_y = StandardScaler().fit(y_train)
+y_train_s = scaler_y.transform(y_train)
+y_test_s = scaler_y.transform(y_test)
+
+# ========== 3. 模型定义 ==========
+class OLEDModel(nn.Module):
+    # ... 同前 OLEDLifePredictor
+    pass
+
+# ========== 4. 训练 ==========
+def train(model, train_loader, val_loader, epochs=300):
+    # 实现早停、保存最佳模型
+    pass
+
+# ========== 5. 评估与预测 ==========
+model.eval()
+with torch.no_grad():
+    preds_s = model(torch.tensor(X_test_s, dtype=torch.float32)).numpy()
+preds_log = scaler_y.inverse_transform(preds_s)
+preds = np.expm1(preds_log)  # 如果做了log变换
+
+# 计算每个目标的RMSE
+for i, name in enumerate(['LT99','LT97','LT95','dV99','dV97','dV95','init_V']):
+    rmse = np.sqrt(np.mean((preds[:,i] - Y_test[:,i])**2))
+    print(f"{name}: RMSE = {rmse:.4f}")
+```
