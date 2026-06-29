@@ -1,0 +1,59 @@
+需要完成一个OLED寿命预测的模型，现在有1023个pkl数据（字典）文件夹为lt_dataset，每一个pkl包括anode,ht,em,et,cathod,cp,life共7组key-value对，其中包括anode,ht,em,et,cathod,cp都是1039长度的np.ndarray（0-1023: ecfp4,1024-1038分别是特定的分子描述符），life是9长度的np.ndarray（每一维分别是0: J,1: T,2: LT99,3: LT97,4: LT95,5: deltaV99,6: deltaV97,7: deltaV95,8: init_V）。完整的方案架构如下（4大模块）
+
+模块一：数据清洗与特征工程（预处理层）
+1. 输入特征降维：每层的ECFP4（1024位稀疏二值）使用增量PCA压缩至64维（保留95%以上方差。PCA(n_components=64)
+2. 层特征组装：每层 = PCA后的64维 + 15个理化属性（1024~1038维） = 79维/层。6层共 474维。	shape = [batch, 6, 79]
+3. 加入物理测试条件：计算3个标量：[log10J, 1000/T_K, log10J * 1000/T_K]	拼接至特征末尾
+4. 目标值变换（关键）：对 LT99, LT97, LT95 取 自然对数（ln(1+LT)）；对 deltaV99/97/95 和 init_V 仅做 Z-score标准化（不减均值，只除标准差，保留极性）。	y_logLT = np.log1p(y_LT)； y_dV = y_dV / y_dV.std()
+5. 数据划分（防泄漏铁律）：按 device_id 分组划分。严禁随机拆分。建议：train_ids 占80%，test_ids 占20%（同一ID下可能有多条不同J/T的数据，必须全部归入同一集合）。GroupShuffleSplit
+6. 归一化：对所有输入特征（474维 + 3标量）进行 QuantileTransformer（映射到标准正态分布），对离群点鲁棒。	QuantileTransformer(output_distribution='normal')
+
+模块二：监督式深度特征提取器（DNN编码器）
+此处用DNN，但不是为了做最终回归，而是为了提取 6层分子之间的高阶交互信息（如界面能级失配、激子淬灭协同效应）。该编码器使用多任务学习进行训练，确保提取出的32维特征富含寿命和电压信息。
+架构设计（参数量严格控制在 3.5万以内）
+```
+输入层: [batch, 6, 79]
+
+# ---- 独立层编码（共享权重，因为各层化学空间差异大，不共享） ----
+Layer1 (Anode):   Linear(79 -> 16) + BatchNorm + Swish + Dropout(0.3)
+Layer2 (HT):      Linear(79 -> 16) + BatchNorm + Swish + Dropout(0.3)
+Layer3 (EM):      Linear(79 -> 16) + BatchNorm + Swish + Dropout(0.3)
+Layer4 (ET):      Linear(79 -> 16) + BatchNorm + Swish + Dropout(0.3)
+Layer5 (Cathode): Linear(79 -> 16) + BatchNorm + Swish + Dropout(0.3)
+Layer6 (CP):      Linear(79 -> 16) + BatchNorm + Swish + Dropout(0.3)
+# 得到 6 个 16维向量 (共96维)
+
+# ---- 物理先验：构造界面差分特征 ----
+Diff_HT_Anode  = HT_emb - Anode_emb
+Diff_EM_HT     = EM_emb - HT_emb
+Diff_ET_EM     = ET_emb - EM_emb
+Diff_Cath_ET   = Cath_emb - ET_emb
+Diff_CP_Cath   = CP_emb - Cath_emb
+# 5个差分向量 × 16 = 80维
+
+# ---- 融合层：压缩为核心表征 ----
+Concat = [96维层嵌入 + 80维差分] = 176维
+Fusion = Linear(176 -> 32) + BatchNorm + Swish + Dropout(0.4)
+最终输出: 32维稠密分子向量 (F_mol)
+```
+编码器的训练方式（监督预训练）：1、训练目标：在32维向量后接两个独立的轻量回归头（各为 Linear(32->1)），分别预测 ln(LT95) 和 init_V（选两个最具代表性的目标）。
+2、损失函数：Loss = 0.7 * MSE(lnLT95) + 0.3 * MSE(init_V)。3、超参数：优化器：AdamW（lr=5e-4, weight_decay=1e-4）、批次大小：32、Epochs：最大200轮，早停（Early Stopping）监控验证集Loss，耐心值=25轮；4、提取特征：训练完成后，剥离掉输出头，将任意器件（训练/测试集）输入网络，提取中间的 32维向量 (F_mol) 作为该器件的最终分子表征。
+（为什么要这样做？ 有监督地训练编码器，能保证32维特征专门朝着影响寿命和电压的方向优化，比无监督自动编码器效果好得多。）
+
+模块三：稳健回归器（XGBoost多任务学习）
+将 32维分子表征 (F_mol) 与 3个物理测试条件标量 拼接，得到 35维输入特征，分别训练 7个独立的XGBoost回归模型（因为LT和deltaV的量纲与分布完全不同）。
+XGBoost 精细化超参数配置（专门应对1023小样本）：
+目标变量 | 损失函数 | 关键超参数 | 理由
+ln(LT99/97/95) | reg:squarederror	| max_depth=3, n_estimators=200, learning_rate=0.05, subsample=0.7, colsample_bytree=0.6, reg_alpha=1.5, reg_lambda=2.0 | 浅树防过拟合；高L1/L2正则化；低学习率配合早停轮次（early_stopping_rounds=30）
+deltaV99/97/95 | reg:squarederror | max_depth=4, n_estimators=150, learning_rate=0.03, subsample=0.8, colsample_bytree=0.7, reg_alpha=1.0, reg_lambda=1.0 | deltaV噪声较大，略微增加深度捕捉非线性，但加强列采样
+init_V | reg:squarederror | max_depth=3, n_estimators=100, learning_rate=0.1, subsample=0.8, colsample_bytree=0.8, reg_alpha=0.5, reg_lambda=0.5 | init_V相对易学，降低正则化防止欠拟合
+1、交叉验证：在训练集（按device_id划分后的）内部进行 5折时序分组交叉验证，用验证集最佳轮数确定最终模型。
+2、输出还原：XGBoost预测出 ln(1+LT) 后，通过 exp(pred) - 1 还原为真实LT值；对deltaV和init_V，乘以训练时保存的 std 还原（因为只做了除标准差，未减均值）。
+
+模块四：物理约束后处理校准（精度提升利器）
+模型预测完毕后，对7个输出进行硬性物理规则校准：
+约束规则	| 校准操作（推理阶段）
+LT99 < LT97 < LT95 | 若违反，令 LT99 = min(pred_LT99, pred_LT97, pred_LT95)，LT95 = max(pred_LT99, pred_LT97, pred_LT95)，LT97 取三者中值。
+deltaV 随 LT 单调不减（物理上电压退化累积） | 计算对应关系：若 deltaV99 > deltaV97，则令 deltaV97 = (deltaV99 + deltaV95) / 2，保持平滑递增。
+init_V ≥ 0 | 若预测值 < 0，直接置为 0.1（或取训练集最小值）。
+这个后处理模块不需要重新训练，在推理时执行，能将“完全反物理”的坏样本比例从约15%降至2%以下。
